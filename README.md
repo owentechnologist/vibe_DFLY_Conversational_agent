@@ -39,23 +39,19 @@ Then confirm with Y when prompted.
 pip3 install -r requirements.txt
 ```
 
-## start the program (connects to localhost 6379 by default):
-
-```
-python3 semanticcache.py
-```
 
 ## start the program with various args:
 
 ```
-python3 semanticcache.py [-H host] [-p port] [-s password] [-u username] [--threshold float]
+python3 app.py [-H host] [-p port] [-s password] [-u username] [--threshold float] --web-port port
 
 ```
 
-## example:
+## example where the webapp is available on port 9026 and it connects to DF on port 7900:
 
 ```
-python3 semanticcache.py -H localhost -p 7900 --threshold .45
-```
+ python3  app.py --web-port 9026 -H localhost -p 7900
+ 
+ ```
 
 
