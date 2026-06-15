@@ -49,19 +49,49 @@ from redisvl.utils.vectorize import HFTextVectorizer
 from redisvl.query.filter import Tag
 from typing_extensions import TypedDict
 
-from semanticcache import DragonflySemanticCache, build_redis_url
+from semanticcache import DragonflySemanticCache
+from settings import (
+    CACHE_DISTANCE_THRESHOLD,
+    CACHE_INDEX_NAME,
+    CATCHALL_CACHE_SESSION_TTL,
+    CATCHALL_CACHE_ALL_TTL,
+    DEDUP_THRESHOLD,
+    DRAGONFLY_HOST,
+    DRAGONFLY_PASSWORD,
+    DRAGONFLY_PORT,
+    DRAGONFLY_USERNAME,
+    EMBEDDING_DIMS,
+    EMBEDDING_MODEL,
+    EXTRACTION_CHUNK_BUDGET,
+    EXTRACTION_EVERY_N,
+    LLM_BASE_URL,
+    LLM_MODEL,
+    LLM_TEMPERATURE_EXTRACTION,
+    PROMPT_AI_TOKEN_LIMIT,
+    PROMPT_HUMAN_CHAR_LIMIT,
+    SESSION_TTL_SECONDS,
+    TOKEN_LIMIT,
+    TOPK_DAY_TTL,
+    TOPK_DECAY,
+    TOPK_DEPTH,
+    TOPK_K,
+    TOPK_MONTH_TTL,
+    TOPK_SESSION_KEY,
+    TOPK_USER_KEY,
+    TOPK_WIDTH,
+    TOPK_YEAR_TTL,
+    build_redis_url,
+)
 
-LLM_BASE_URL = "http://localhost:6060/v1"
-LLM_MODEL = "qwen3.5-9b-glm5.1-distill-v1"
-EMBEDDING_MODEL = "sentence-transformers/all-mpnet-base-v2"
-EMBEDDING_DIMS = 768  # all-mpnet-base-v2 output dimension
-CACHE_INDEX_NAME = "llm_semantic_cache"
-EXTRACTION_EVERY_N = 3
+_initialized_topk_keys: set[str] = set()
+EMPTY_RESPONSE_PLACEHOLDER = (
+    "it appears I either have nothing to say, or require more tokens to complete my processing of that request"
+)
 
 _CATCHALL_PATTERNS = (
     "what do you know about me",
     "what have i told you",
-    "remind me what we",
+    "remind me what information we have exchanged",
     "what did we talk about",
     "summarize what you know",
     "what do you remember",
@@ -74,19 +104,124 @@ def _user_ns(user_id: str) -> tuple[str, ...]:
     return ("user", user_id, "long_term")
 
 
+def _user_session_ns(user_id: str, session_id: str) -> tuple[str, ...]:
+    return ("user", user_id, "session", session_id)
+
+
+_EDIT_PATTERNS = (
+    "actually,",
+    "that's not right",
+    "that's wrong",
+    "that's incorrect",
+    "you're wrong",
+    "let me correct",
+    "to clarify,",
+    "actually i ",
+    "actually my ",
+    "i prefer ",
+    "my preference is",
+    "please remember that",
+    "please note that",
+    "forget that",
+    "i should clarify",
+    "to be clear,",
+    "please update that",
+    "please correct that",
+)
+
+SESSION_EDIT_PROMPT = (
+    "The user is correcting or stating a preference/fact about themselves. "
+    "Extract the corrected fact or preference as a single clear statement. "
+    "Return ONLY valid JSON:\n"
+    '{"text": "the fact or preference"}'
+)
+
+
 def _is_catchall(query: str) -> bool:
     q = query.lower()
     return any(p in q for p in _CATCHALL_PATTERNS)
 
+
+def _is_edit_intent(query: str) -> bool:
+    q = query.lower()
+    return any(p in q for p in _EDIT_PATTERNS)
+
+
+def _estimate_tokens(text: str) -> int:
+    return len(text) // 4
+
+
+def _chunk_messages(messages: list[BaseMessage], budget: int = EXTRACTION_CHUNK_BUDGET) -> list[list[BaseMessage]]:
+    chunks: list[list[BaseMessage]] = []
+    chunk: list[BaseMessage] = []
+    count = 0
+    for msg in messages:
+        t = _estimate_tokens(msg.content)
+        if count + t > budget and chunk:
+            chunks.append(chunk)
+            chunk, count = [], 0
+        chunk.append(msg)
+        count += t
+    if chunk:
+        chunks.append(chunk)
+    return chunks
+
+def _compress_prompt_messages(messages: list[BaseMessage]) -> list[BaseMessage]:
+    """Enforce per-turn size limits before sending history to the LLM.
+
+    - Each AI message is truncated to PROMPT_AI_TOKEN_LIMIT tokens (char estimate).
+    - Oldest human turns are dropped (along with their paired AI reply) until the
+      total human-message character count fits within PROMPT_HUMAN_CHAR_LIMIT.
+      If the newest human message alone exceeds the limit, it is trimmed from the start.
+    """
+    ai_char_limit = PROMPT_AI_TOKEN_LIMIT * 4
+
+    # Pass 1: cap each AI message
+    result: list[BaseMessage] = []
+    for msg in messages:
+        if isinstance(msg, AIMessage) and len(msg.content) > ai_char_limit:
+            result.append(AIMessage(content=msg.content[:ai_char_limit] + "…"))
+        else:
+            result.append(msg)
+
+    # Pass 2: drop/trim oldest human turns until human total <= PROMPT_HUMAN_CHAR_LIMIT
+    human_total = sum(len(m.content) for m in result if isinstance(m, HumanMessage))
+    excess = human_total - PROMPT_HUMAN_CHAR_LIMIT
+    i = 0
+    while i < len(result) and excess > 0:
+        if isinstance(result[i], HumanMessage):
+            c = len(result[i].content)
+            if c <= excess:
+                result.pop(i)
+                if i < len(result) and isinstance(result[i], AIMessage):
+                    result.pop(i)
+                excess -= c
+            else:
+                result[i] = HumanMessage(content=result[i].content[excess:])
+                excess = 0
+                i += 1
+        else:
+            i += 1
+
+    return result
+
+
 EXTRACTION_PROMPT = (
-    "Given this conversation excerpt, extract persistent facts, user preferences, "
-    "and notable topics. Return ONLY valid JSON:\n"
-    '{"facts": ["..."], "preferences": ["..."], "topics": ["..."], "summary": "..."}'
+    "Given this conversation excerpt, extract facts, user preferences, and notable topics. "
+    "For each fact and preference assign a scope:\n"
+    "  'user'    — stable info that should persist across all future sessions "
+    "(e.g. name, job, location, permanent preferences)\n"
+    "  'session' — time-sensitive or context-specific, relevant only to this conversation "
+    "(e.g. current news concerns, today's tasks, temporary context)\n"
+    "Return ONLY valid JSON:\n"
+    '{"facts": [{"text": "...", "scope": "user|session"}], '
+    '"preferences": [{"text": "...", "scope": "user|session"}], '
+    '"topics": ["..."], "summary": "..."}'
 )
 
 
 class DragonflyRedisStore(AsyncRedisStore):
-    """AsyncRedisStore patched for Dragonfly Search compatibility.
+    r"""AsyncRedisStore patched for Dragonfly Search compatibility.
 
     Dragonfly Search doesn't support backslash-escaped dots in TEXT field exact
     queries (e.g. @prefix:user\.long_term) — same class of issue as the
@@ -201,7 +336,7 @@ class DragonflyRedisStore(AsyncRedisStore):
         to_embed: list[tuple[str, str, str, str]] = []
 
         for op in deletes:
-            query = f"@prefix:{self._tag_filter(op.namespace)} @key:{{{op.key}}}"
+            query = f"@prefix:{self._tag_filter(op.namespace)} @key:{{{_token_escaper.escape(op.key)}}}"
             results = await self.store_index.search(query)
             for doc in results.docs:
                 await self._redis.delete(doc.id)
@@ -427,25 +562,40 @@ class DragonflyRedisStore(AsyncRedisStore):
                 for cond in op.match_conditions:
                     ns_text = _namespace_to_text(cond.path, handle_wildcards=True)
                     if cond.match_type == "prefix":
-                        conditions.append(f"@prefix:{{{ns_text}*}}")   # TAG wildcard
+                        conditions.append(f"@prefix:{{{ns_text}*}}")
                     elif cond.match_type == "suffix":
-                        conditions.append(f"@prefix:*{ns_text}")        # TEXT fallback
+                        conditions.append(f"@prefix:*{ns_text}")
                 if conditions:
                     base_query = " ".join(conditions)
 
             try:
-                res = await self.store_index.search(FilterQuery(filter_expression=base_query, return_fields=["prefix"]))
+                raw = await self._redis.execute_command(
+                    "FT.AGGREGATE", self.store_prefix,
+                    base_query,
+                    "LOAD", "1", "prefix",
+                    "GROUPBY", "1", "@prefix",
+                    "LIMIT", "0", "10000",
+                    "DIALECT", "2",
+                )
             except Exception:
                 results[idx] = []
                 continue
 
+            # raw[0] is result count; raw[1:] are rows of alternating field/value pairs
             namespaces: set = set()
-            for doc in res.docs:
-                if hasattr(doc, "prefix"):
-                    ns = tuple(_token_unescaper.unescape(doc.prefix).split("."))
-                    if op.max_depth is not None:
-                        ns = ns[:op.max_depth]
-                    namespaces.add(ns)
+            for row in raw[1:]:
+                if not isinstance(row, (list, tuple)):
+                    continue
+                for i in range(0, len(row) - 1, 2):
+                    field = row[i]
+                    val = row[i + 1]
+                    if (field.decode() if isinstance(field, bytes) else field) == "prefix":
+                        prefix_str = val.decode() if isinstance(val, bytes) else val
+                        ns = tuple(prefix_str.split("."))
+                        if op.max_depth is not None:
+                            ns = ns[:op.max_depth]
+                        namespaces.add(ns)
+                        break
 
             sorted_ns = sorted(namespaces)
             if op.limit or op.offset:
@@ -471,40 +621,175 @@ class HFVectorizerEmbeddings(Embeddings):
 
 class AgentState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
-    memories: list[str]  # retrieved long-term context, injected fresh each turn
+    memories: list[str]          # retrieved long-term context, injected fresh each turn
+    catchall_scope: Optional[str]  # "session" | "all" | None — set before ainvoke on catchall queries
 
 
-def build_graph(llm: ChatOpenAI, cache: DragonflySemanticCache, user_id: str) -> StateGraph:
+async def _setup_topk_keys(redis_client) -> None:
+    for key in (TOPK_SESSION_KEY, TOPK_USER_KEY):
+        if not await redis_client.exists(key):
+            try:
+                await redis_client.execute_command(
+                    "TOPK.RESERVE", key, TOPK_K, TOPK_WIDTH, TOPK_DEPTH, TOPK_DECAY
+                )
+            except Exception:
+                pass
+        _initialized_topk_keys.add(key)
+
+
+async def _ensure_topk_key(redis_client, key: str, ttl: int) -> None:
+    if key in _initialized_topk_keys:
+        return
+    if not await redis_client.exists(key):
+        try:
+            await redis_client.execute_command(
+                "TOPK.RESERVE", key, TOPK_K, TOPK_WIDTH, TOPK_DEPTH, TOPK_DECAY
+            )
+            await redis_client.expire(key, ttl)
+        except Exception:
+            pass
+    _initialized_topk_keys.add(key)
+
+
+async def _record_tokens(redis_client, user_id: str, session_id: str, tokens: int) -> None:
+    if tokens <= 0:
+        return
+    now = datetime.now(timezone.utc)
+    day_str   = now.strftime("%Y%m%d")
+    month_str = now.strftime("%Y%m")
+    year_str  = now.strftime("%Y")
+    session_entry = f"{user_id}:{session_id}"
+
+    time_keys = [
+        (f"topk:tokens:session:day:{day_str}",    session_entry, TOPK_DAY_TTL),
+        (f"topk:tokens:user:day:{day_str}",        user_id,       TOPK_DAY_TTL),
+        (f"topk:tokens:session:month:{month_str}", session_entry, TOPK_MONTH_TTL),
+        (f"topk:tokens:user:month:{month_str}",   user_id,       TOPK_MONTH_TTL),
+        (f"topk:tokens:session:year:{year_str}",  session_entry, TOPK_YEAR_TTL),
+        (f"topk:tokens:user:year:{year_str}",     user_id,       TOPK_YEAR_TTL),
+    ]
+    for key, _, ttl in time_keys:
+        await _ensure_topk_key(redis_client, key, ttl)
+
+    pipe = redis_client.pipeline(transaction=False)
+    pipe.execute_command("TOPK.INCRBY", TOPK_SESSION_KEY, session_entry, tokens)
+    pipe.execute_command("TOPK.INCRBY", TOPK_USER_KEY, user_id, tokens)
+    for key, entry, _ in time_keys:
+        pipe.execute_command("TOPK.INCRBY", key, entry, tokens)
+    await pipe.execute()
+
+
+async def _fetch_memories(
+    store: BaseStore,
+    ns: tuple,
+    session_ns: tuple,
+    query: str,
+    catchall: bool = False,
+) -> tuple[list[tuple[str, str]], int, int]:
+    """Search both namespaces session-first, deduplicate by text.
+
+    Returns (items, lt_count, sess_count) where items is a list of (text, key) pairs
+    and the counts are pre-dedup sizes for observability logging.
+    """
+    if catchall:
+        lt_results = await store.asearch(ns, limit=20)
+        sess_results = await store.asearch(session_ns, limit=20)
+    else:
+        lt_results = await store.asearch(ns, query=query, limit=3)
+        sess_results = await store.asearch(session_ns, query=query, limit=3)
+    seen: set[str] = set()
+    items: list[tuple[str, str]] = []
+    for r in [*sess_results, *lt_results]:
+        txt = r.value.get("text", "")
+        if txt and txt not in seen:
+            seen.add(txt)
+            items.append((txt, r.key or ""))
+    return items, len(lt_results), len(sess_results)
+
+
+def build_graph(llm: ChatOpenAI, cache: DragonflySemanticCache, user_id: str, session_id: str, redis_client) -> StateGraph:
     ns = _user_ns(user_id)
+    session_ns = _user_session_ns(user_id, session_id)
 
     async def retrieve_memories(state: AgentState, *, store: BaseStore) -> dict:
         if not state["messages"]:
             return {"memories": []}
         query = state["messages"][-1].content
-        if _is_catchall(query):
-            results = await store.asearch(ns, limit=20)
-        else:
-            results = await store.asearch(ns, query=query, limit=3)
-        return {"memories": [r.value["text"] for r in results if r.value.get("text")]}
+        scope = state.get("catchall_scope")
+
+        if scope == "session":
+            results = await store.asearch(session_ns, limit=20)
+            return {"memories": [r.value["text"] for r in results if r.value.get("text")]}
+
+        catchall = scope == "all" or _is_catchall(query)
+        items, _lt_count, _ss_count = await _fetch_memories(store, ns, session_ns, query, catchall=catchall)
+        return {"memories": [txt for txt, _key in items]}
 
     async def chat(state: AgentState) -> dict:
         user_msg = state["messages"][-1].content
+        scope = state.get("catchall_scope")
 
-        hits = cache.check(prompt=user_msg)
+        # Resolve cache scope and TTL based on clarified intent.
+        if scope == "session":
+            cache_session_id = session_id
+            cache_ttl = CATCHALL_CACHE_SESSION_TTL
+        elif scope == "all":
+            cache_session_id = None
+            cache_ttl = CATCHALL_CACHE_ALL_TTL
+        else:
+            cache_session_id = None
+            cache_ttl = None
+
+        hits = cache.check(
+            prompt=user_msg,
+            user_id=user_id,
+            session_id=cache_session_id,
+        )
         if hits:
             return {"messages": [AIMessage(content=hits[0]["response"])]}
 
-        system_parts = ["You are a helpful assistant."]
-        if state.get("memories"):
+        system_parts = ["You are a helpful and concise assistant with an excellent memory."]
+        if scope == "session":
+            system_parts.append(
+                "\nThe user wants a summary of this conversation only. "
+                "Summarize the key topics, facts shared, and any preferences expressed so far in this session."
+            )
+            if state.get("memories"):
+                system_parts.append(
+                    "\nFacts and preferences explicitly noted this session:\n"
+                    + "\n".join(f"- {m}" for m in state["memories"])
+                )
+        elif scope == "all":
+            if state.get("memories"):
+                system_parts.append(
+                    "\nThe user wants a summary of everything you know about them across all sessions. "
+                    "Here are all stored facts and preferences:\n"
+                    + "\n".join(f"- {m}" for m in state["memories"])
+                )
+        elif state.get("memories"):
             system_parts.append(
                 "\nRelevant context from past sessions:\n"
                 + "\n".join(f"- {m}" for m in state["memories"])
             )
+
         response = await llm.ainvoke(
-            [SystemMessage(content="\n".join(system_parts))] + list(state["messages"])
+            [SystemMessage(content="\n".join(system_parts))]
+            + _compress_prompt_messages(list(state["messages"]))
         )
-        cache.store(prompt=user_msg, response=response.content)
-        return {"messages": [AIMessage(content=response.content)]}
+        content = response.content or EMPTY_RESPONSE_PLACEHOLDER
+        tokens = (response.usage_metadata or {}).get("total_tokens", 0)
+        if not tokens:
+            tokens = _estimate_tokens(user_msg) + _estimate_tokens(content)
+        await _record_tokens(redis_client, user_id, session_id, tokens)
+        if response.content:
+            cache.store(
+                prompt=user_msg,
+                response=response.content,
+                user_id=user_id,
+                session_id=cache_session_id,
+                ttl=cache_ttl,
+            )
+        return {"messages": [AIMessage(content=content)]}
 
     g = StateGraph(AgentState)
     g.add_node("retrieve_memories", retrieve_memories)
@@ -521,35 +806,117 @@ async def extract_and_store(
     llm: ChatOpenAI,
     session_id: str,
     user_id: str,
+    cache: DragonflySemanticCache,
+    session_ttl_minutes: int = 1440,
 ) -> None:
     if len(messages) < 2:
         return
-    conv = "\n".join(
-        f"{'User' if isinstance(m, HumanMessage) else 'Assistant'}: {m.content}"
-        for m in messages[-10:]
-    )
-    try:
-        resp = await llm.ainvoke([
-            SystemMessage(content=EXTRACTION_PROMPT),
-            HumanMessage(content=conv),
-        ])
-        data = json.loads(resp.content)
-    except Exception:
-        return
 
     ns = _user_ns(user_id)
-    ts = str(int(time.time()))
-    entries: list[tuple[str, str]] = (
-        [(f"fact_{ts}_{i}", t) for i, t in enumerate(data.get("facts", []))]
-        + [(f"pref_{ts}_{i}", t) for i, t in enumerate(data.get("preferences", []))]
-        + ([(f"summary_{ts}", data["summary"])] if data.get("summary") else [])
-    )
-    for key, text in entries:
-        await store.aput(
-            ns,
-            f"{session_id}_{key}",
-            {"text": text, "session_id": session_id, "ts": ts},
+    session_ns = _user_session_ns(user_id, session_id)
+
+    def _item_scope(item) -> tuple[str, str]:
+        """Return (text, scope) from either a {text, scope} dict or a plain string."""
+        if isinstance(item, dict):
+            scope = item.get("scope", "user")
+            return item.get("text", ""), scope if scope in ("user", "session") else "user"
+        return str(item), "user"
+
+    async def _extract_chunk(chunk: list[BaseMessage]) -> tuple[list[tuple[str, str, str]], dict]:
+        conv = "\n".join(
+            f"{'User' if isinstance(m, HumanMessage) else 'Assistant'}: {m.content}"
+            for m in chunk
         )
+        try:
+            resp = await llm.ainvoke([
+                SystemMessage(content=EXTRACTION_PROMPT),
+                HumanMessage(content=conv),
+            ])
+            data = json.loads(resp.content)
+        except Exception:
+            return [], {}
+        ts = str(int(time.time()))
+        entries: list[tuple[str, str, str]] = []
+        for i, item in enumerate(data.get("facts", [])):
+            text, scope = _item_scope(item)
+            if text:
+                entries.append((f"fact_{ts}_{i}", text, scope))
+        for i, item in enumerate(data.get("preferences", [])):
+            text, scope = _item_scope(item)
+            if text:
+                entries.append((f"pref_{ts}_{i}", text, scope))
+        if data.get("summary"):
+            entries.append((f"summary_{ts}", data["summary"], "user"))
+        return entries, data
+
+    chunks = _chunk_messages(messages)
+    chunk_results = await asyncio.gather(*[_extract_chunk(c) for c in chunks])
+
+    ts = str(int(time.time()))
+    cache_parts: list[str] = []
+
+    for entries, data in chunk_results:
+        for key, text, scope in entries:
+            target_ns = ns if scope == "user" else session_ns
+            existing = await store.asearch(target_ns, query=text, limit=1)
+            if existing and existing[0].score >= DEDUP_THRESHOLD:
+                continue
+            put_kwargs: dict = {"ttl": session_ttl_minutes} if scope == "session" else {}
+            await store.aput(
+                target_ns,
+                f"{session_id}_{key}",
+                {"text": text, "session_id": session_id, "ts": ts, "scope": scope},
+                **put_kwargs,
+            )
+
+        parts = []
+        if data.get("facts"):
+            parts.append("Facts:\n" + "\n".join(
+                f"- {f['text'] if isinstance(f, dict) else f}" for f in data["facts"]
+            ))
+        if data.get("preferences"):
+            parts.append("Preferences:\n" + "\n".join(
+                f"- {p['text'] if isinstance(p, dict) else p}" for p in data["preferences"]
+            ))
+        if data.get("summary"):
+            parts.append(f"Summary: {data['summary']}")
+        cache_parts.extend(parts)
+
+    if cache_parts:
+        cache.refresh_catchall_cache(
+            session_id, user_id, "\n\n".join(cache_parts), _CATCHALL_PATTERNS,
+            ttl=CATCHALL_CACHE_SESSION_TTL,
+        )
+
+
+async def _extract_and_store_session_edit(
+    user_msg: str,
+    assistant_reply: str,
+    store: BaseStore,
+    llm: ChatOpenAI,
+    session_id: str,
+    user_id: str,
+    session_ttl_minutes: int,
+) -> None:
+    session_ns = _user_session_ns(user_id, session_id)
+    try:
+        resp = await llm.ainvoke([
+            SystemMessage(content=SESSION_EDIT_PROMPT),
+            HumanMessage(content=f"User: {user_msg}\nAssistant: {assistant_reply}"),
+        ])
+        data = json.loads(resp.content)
+        text = data.get("text", "").strip()
+    except Exception:
+        return
+    if not text:
+        return
+    ts = str(int(time.time()))
+    await store.aput(
+        session_ns,
+        f"edit_{ts}",
+        {"text": text, "session_id": session_id, "ts": ts},
+        ttl=session_ttl_minutes,
+    )
 
 
 async def run(args: argparse.Namespace) -> None:
@@ -564,15 +931,21 @@ async def run(args: argparse.Namespace) -> None:
         vectorizer=vectorizer,
         redis_url=redis_url,
         distance_threshold=args.threshold,
-        overwrite=False,
+        overwrite=True,
+        filterable_fields=[
+            {"name": "user_id", "type": "tag"},
+            {"name": "session_id", "type": "tag"},
+        ],
     )
     llm = ChatOpenAI(
         base_url=LLM_BASE_URL,
         model=LLM_MODEL,
         api_key="not-needed",
-        temperature=0.25,
+        temperature=LLM_TEMPERATURE_EXTRACTION,
+        max_tokens=TOKEN_LIMIT,
     )
 
+    session_ttl_minutes = max(1, args.ttl // 60)
     ttl_cfg = {"default_ttl": args.ttl, "refresh_on_read": True}
     index_cfg = {"embed": HFVectorizerEmbeddings(vectorizer), "dims": EMBEDDING_DIMS, "fields": ["text"]}
 
@@ -580,8 +953,9 @@ async def run(args: argparse.Namespace) -> None:
         await checkpointer.asetup()
         async with DragonflyRedisStore.from_conn_string(redis_url, index=index_cfg) as store:
             store.setup()
+            await _setup_topk_keys(store._redis)
 
-            compiled = build_graph(llm, cache, user_id).compile(checkpointer=checkpointer, store=store)
+            compiled = build_graph(llm, cache, user_id, session_id, store._redis).compile(checkpointer=checkpointer, store=store)
 
             print(f"User    : {user_id}")
             print(f"Session : {session_id}")
@@ -598,8 +972,17 @@ async def run(args: argparse.Namespace) -> None:
                     if not user_input or user_input.lower() == "end":
                         break
 
+                    catchall_scope = None
+                    if _is_catchall(user_input):
+                        print(
+                            "\nAssistant: Do you want me to reflect on this session alone, "
+                            "or on all the discussions we have had? (session/all)"
+                        )
+                        scope_raw = input("You> ").strip().lower()
+                        catchall_scope = "session" if "session" in scope_raw else "all"
+
                     result = await compiled.ainvoke(
-                        {"messages": [HumanMessage(content=user_input)], "memories": []},
+                        {"messages": [HumanMessage(content=user_input)], "memories": [], "catchall_scope": catchall_scope},
                         config=config,
                     )
                     reply = result["messages"][-1].content
@@ -608,9 +991,17 @@ async def run(args: argparse.Namespace) -> None:
 
                     print(f"\nAssistant: {reply}\n")
 
+                    if _is_edit_intent(user_input):
+                        pending.append(asyncio.create_task(
+                            _extract_and_store_session_edit(
+                                user_input, reply, store, llm,
+                                session_id, user_id, session_ttl_minutes,
+                            )
+                        ))
+
                     if not args.no_background and turn_count % EXTRACTION_EVERY_N == 0:
                         pending.append(asyncio.create_task(
-                            extract_and_store(list(messages), store, llm, session_id, user_id)
+                            extract_and_store(list(messages), store, llm, session_id, user_id, cache, session_ttl_minutes)
                         ))
                         print("[Background memory extraction scheduled]")
 
@@ -621,21 +1012,21 @@ async def run(args: argparse.Namespace) -> None:
                 await asyncio.gather(*pending, return_exceptions=True)
 
             print("Extracting session memories...")
-            await extract_and_store(messages, store, llm, session_id, user_id)
+            await extract_and_store(messages, store, llm, session_id, user_id, cache, session_ttl_minutes)
             print("Memories saved.")
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="LangGraph agent with two-tier memory on DragonflyDB")
-    p.add_argument("-H", "--host", default="localhost")
-    p.add_argument("-p", "--port", type=int, default=7900)
-    p.add_argument("-s", "--password", default=None)
-    p.add_argument("-u", "--username", default=None)
-    p.add_argument("--threshold", type=float, default=0.15)
-    p.add_argument("--session", default=None, help="Resume a prior session by ID")
-    p.add_argument("--ttl", type=int, default=86400, help="Session memory TTL in seconds (default 24h)")
-    p.add_argument("--user", default="default", help="Stable user ID for memory namespace isolation")
-    p.add_argument("--no-background", action="store_true", dest="no_background")
+    p.add_argument("-H", "--host",     default=DRAGONFLY_HOST)
+    p.add_argument("-p", "--port",     type=int, default=DRAGONFLY_PORT)
+    p.add_argument("-s", "--password", default=DRAGONFLY_PASSWORD)
+    p.add_argument("-u", "--username", default=DRAGONFLY_USERNAME)
+    p.add_argument("--threshold",      type=float, default=CACHE_DISTANCE_THRESHOLD)
+    p.add_argument("--session",        default=None, help="Resume a prior session by ID")
+    p.add_argument("--ttl",            type=int, default=SESSION_TTL_SECONDS, help="Session memory TTL in seconds")
+    p.add_argument("--user",           default="default", help="Stable user ID for memory namespace isolation")
+    p.add_argument("--no-background",  action="store_true", dest="no_background")
     return p.parse_args()
 
 
