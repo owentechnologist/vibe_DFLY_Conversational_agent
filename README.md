@@ -28,9 +28,9 @@ Best for developers, sysadmins, or teams who want to self-host an entire API inf
 
 </details>
 
-### In agent.py you will find the setup for connecting to the http accessible LLM and the embedding model for semantic cache use:
+### In settings.py you will find the setup for connecting to the http accessible LLM and the embedding model for semantic cache use:
 
-Adjust these to suit your deployment / preferred LLM etc
+Adjust these and other settings to suit your deployment / preferred LLM etc
 
 ```
 LLM_BASE_URL = "http://localhost:6060/v1"

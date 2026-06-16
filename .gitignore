@@ -2,3 +2,6 @@
 /lcenv
 owennotes.txt
 .DS_Store
+mlx_server.log
+/__pycache__
+agentstateguide.md
