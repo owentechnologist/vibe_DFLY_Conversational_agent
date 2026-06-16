@@ -315,7 +315,7 @@ async def _do_summarize(user_id: str, session_id: str) -> dict:
     activity.append(_log("SUMMARIZE_FOUND", f"Retrieved {len(all_session_items)} entries",
                          f"{len(facts)} facts · {len(prefs)} preferences · {len(topics)} topics"))
 
-    if not session_items:
+    if not all_session_items:
         activity.append(_log("SUMMARIZE_EMPTY", "No memories found for this session yet"))
         return {"summary": "(No memories stored for this session yet.)", "activity": activity}
 
