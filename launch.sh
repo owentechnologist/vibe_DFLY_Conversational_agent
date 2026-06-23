@@ -2,7 +2,8 @@
 
 # Configuration Variables
 PORT=6060
-MODEL="mlx-community/Qwen3-14B-4bit"
+MODEL="mlx-community/Phi-3.5-MoE-instruct-8bit"
+#MODEL="mlx-community/Qwen3-14B-4bit"
 PYTHON_BIN="lcenv/bin/python"
 SERVER_URL="http://localhost:$PORT/v1/models"
 APP_SCRIPT="app.py"
