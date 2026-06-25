@@ -1,13 +1,50 @@
 #!/bin/bash
 
 # Configuration Variables
-PORT=6060
+MLX_PORT=6060
 MODEL="mlx-community/Phi-3.5-MoE-instruct-8bit"
 #MODEL="mlx-community/Qwen3-14B-4bit"
 PYTHON_BIN="lcenv/bin/python"
-SERVER_URL="http://localhost:$PORT/v1/models"
+SERVER_URL="http://localhost:$MLX_PORT/v1/models"
 APP_SCRIPT="app.py"
-APP_ARGS="--web-port 9026 -H localhost -p 7900" # Change this to agent.py if needed
+
+# 1. Define default values for dragonfly and the conversational agent app
+WEB_PORT="9026"
+HOST="localhost"
+PORT="7900"
+SECRET=
+
+# launch.sh -H localhost -p 7900 -s mypass
+# 2. Parse command-line arguments to override defaults
+while [[ $# -gt 0 ]]; do
+case "$1" in
+    --web-port)
+      WEB_PORT="$2"
+      shift 2
+      ;;  # <--- Must have this
+    -H)
+      HOST="$2"
+      shift 2
+      ;;  # <--- Must have this
+    -p)
+      PORT="$2"
+      shift 2
+      ;;  # <--- Must have this
+    -s)
+      SECRET="$2"
+      shift 2
+      ;;  # <--- Must have this
+    *)
+      echo "Unknown argument: $1"
+      exit 1
+      ;;  # <--- Good practice to have this here too
+  esac    # <--- Check that this is spelled correctly
+done
+
+# 3. Construct the final APP_ARGS variable
+APP_ARGS="--web-port $WEB_PORT -H $HOST -p $PORT -s $SECRET"
+
+#APP_ARGS="--web-port 9026 -H localhost -p 7900" # Change this to agent.py if needed
 #APP_ARGS="--web-port 9026 -H mydata.dragonflydb.cloud -p 6385 -s <giveit>"
 # FIX: Force Metal to recycle and combine buffer handles before hitting the 499k ceiling
 export MLX_METAL_RECYCLE_FLUSH_THRESHOLD=1000
@@ -25,7 +62,7 @@ trap cleanup SIGINT SIGTERM
 echo "🚀 Starting Native Apple Silicon Stack..."
 
 # 1. Spin up the mlx-lm server in the background
-$PYTHON_BIN -m mlx_lm server --model "$MODEL" --port "$PORT" --log-level INFO --prefill-step-size 1024  > mlx_server.log 2>&1 &
+$PYTHON_BIN -m mlx_lm server --model "$MODEL" --port "$MLX_PORT" --log-level INFO --prefill-step-size 1024  > mlx_server.log 2>&1 &
 
 SERVER_PID=$!
 

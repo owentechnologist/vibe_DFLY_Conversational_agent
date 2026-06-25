@@ -755,7 +755,7 @@ def build_graph(llm: ChatOpenAI, cache: DragonflySemanticCache, user_id: str, se
         if hits:
             return {"messages": [AIMessage(content=hits[0]["response"])]}
 
-        system_parts = ["You are a helpful and concise assistant with an excellent memory."]
+        system_parts = ["You are a concise assistant with an excellent memory. Be brief and succinct. Limit examples to one or two. Avoid repeating yourself."]
         if scope == "session":
             system_parts.append(
                 "\nThe user wants a summary of this conversation only. "

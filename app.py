@@ -1,4 +1,5 @@
 """
+  case
 Bottle web UI for the DragonflyDB conversational agent — multi-user, per-user memory isolation.
 
 Memory is namespaced per user: ("user", <user_id>, "long_term").
@@ -169,7 +170,7 @@ def build_web_graph(llm: ChatOpenAI, cache: DragonflySemanticCache, user_id: str
         log.append(_log("CACHE_MISS", "No cache hit — invoking LLM"))
         n_mem = len(state.get("memories", []))
         n_msg = len(state["messages"])
-        system_parts = ["You are a helpful assistant."]
+        system_parts = ["You are a concise assistant with an excellent memory. Be brief and succinct. Limit examples to one or two. Avoid repeating yourself."]
         if state.get("memories"):
             system_parts.append(
                 "\nRelevant context from past sessions:\n"
