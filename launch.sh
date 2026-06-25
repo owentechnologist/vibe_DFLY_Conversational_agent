@@ -8,7 +8,7 @@ PYTHON_BIN="lcenv/bin/python"
 SERVER_URL="http://localhost:$PORT/v1/models"
 APP_SCRIPT="app.py"
 APP_ARGS="--web-port 9026 -H localhost -p 7900" # Change this to agent.py if needed
-
+#APP_ARGS="--web-port 9026 -H mydata.dragonflydb.cloud -p 6385 -s <giveit>"
 # FIX: Force Metal to recycle and combine buffer handles before hitting the 499k ceiling
 export MLX_METAL_RECYCLE_FLUSH_THRESHOLD=1000
 

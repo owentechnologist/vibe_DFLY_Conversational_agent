@@ -47,6 +47,7 @@ from langgraph.store.redis.aio import (
 )
 from redisvl.utils.vectorize import HFTextVectorizer
 from redisvl.query.filter import Tag
+from redisvl.exceptions import RedisSearchError
 from typing_extensions import TypedDict
 
 from semanticcache import DragonflySemanticCache
@@ -244,6 +245,7 @@ class DragonflyRedisStore(AsyncRedisStore):
         store_prefix: str = "store",
         vector_prefix: str = "store_vectors",
     ) -> None:
+        connection_args = {"socket_keepalive": True, **(connection_args or {})}
         super().__init__(
             redis_url,
             redis_client=redis_client,
@@ -501,7 +503,12 @@ class DragonflyRedisStore(AsyncRedisStore):
                     num_results=limit,
                 )
                 vector_query.paging(offset, limit)
-                vector_results_docs = await self.vector_index.query(vector_query)
+                try:
+                    vector_results_docs = await self.vector_index.query(vector_query)
+                except RedisSearchError:
+                    # Stale pool connection (ECONNRESET); retry once.
+                    await asyncio.sleep(0.1)
+                    vector_results_docs = await self.vector_index.query(vector_query)
 
                 result_map: dict = {}
                 pipeline = self._redis.pipeline(transaction=False)
