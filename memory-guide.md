@@ -4,15 +4,15 @@ This agent has three layers of memory, each serving a different purpose. Here's 
 
 ---
 
-## Layer 1 — Semantic Cache (cross-session, prompt-level deduplication)
+## Layer 1 — Semantic Cache (session-specific, prompt-level deduplication)
 
 Before the LLM is ever called, every user message is checked against a **semantic cache** stored in DragonflyDB (`DragonflySemanticCache`). The cache holds prior prompt/response pairs as vector embeddings. If your new message is semantically close enough to a cached prompt (within the `--threshold` cosine distance, default `0.15`), the cached response is returned immediately — no LLM call happens at all.
 
-This is not "memory" in the conversational sense. It's a cost and latency optimization. The cache is shared across all sessions: if two different users ask essentially the same question, the second one gets the cached answer.
+This is not "memory" in the conversational sense. It's a cost and latency optimization. The cache is local to a specific session for a user: if two different users ask essentially the same question, the second one will *not* receive the cached response.  If the same user in two different sessions asks the same question they will also NOT get the cached response.
 
 **What it stores:** the prompt text and the LLM's response, indexed as a 768-dimension vector (`sentence-transformers/all-mpnet-base-v2`).
 
-**Where it lives:** DragonflyDB, index name `llm_semantic_cache`, port `6379` by default.
+**Where it lives:** DragonflyDB, index name `llm_semantic_cache`.
 
 **When it's consulted:** at the very start of every turn, before the graph runs.
 
@@ -43,7 +43,7 @@ This is where the agent actually learns things about you across sessions. The ag
 Long-term memories are not stored raw. An LLM extraction pass distills the conversation into structured entries: facts, preferences, topics, and a summary. Each item becomes its own document in the store under the namespace `("user", "long_term")`, keyed like `{session_id}_fact_<ts>_0`, `{session_id}_pref_<ts>_0`, etc.
 
 **When extraction runs:**
-- **Every 3rd LLM response** during a session — an `asyncio` background task fires silently while you keep chatting. You'll see `[Background memory extraction scheduled]` in the console.
+- **Every X (configurable) LLM response** during a session — an `asyncio` background task fires silently while you keep chatting. You'll see `[Background memory extraction scheduled]` in the console.
 - **On exit** — a final synchronous extraction pass runs before the process terminates, ensuring the session is fully committed.
 
 **How memories are used at the start of a turn:**  
@@ -51,7 +51,7 @@ The `retrieve_memories` node runs before the `chat` node. It takes your latest m
 
 **What it stores:** plain-text snippets, each with `text`, `session_id`, and `ts` fields. The `text` field is also vectorized so semantic search works.
 
-**Where it lives:** DragonflyDB, port `7900`, namespace `user.long_term` (stored as a TAG field for Dragonfly Search compatibility — see `dragonfly-search-compat.md`).
+**Where it lives:** DragonflyDB, namespace `user.long_term` (stored as a TAG field for Dragonfly Search compatibility — see `dragonfly-search-compat.md`).
 
 ---
 
@@ -100,4 +100,4 @@ You type a message
 | `--no-background` | off | Disable mid-session background extraction |
 | `-H / -p` | `localhost:7900` | DragonflyDB connection (agent) |
 
-The semantic cache (`semanticcache.py`) defaults to port `6379`. The agent (`agent.py`) defaults to port `7900`.
+The semantic cache and the agent normally share the same cache, but could use separate caches if that proved useful.
