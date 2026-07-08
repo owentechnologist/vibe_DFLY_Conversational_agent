@@ -2,6 +2,8 @@
 
 # Configuration Variables
 MLX_PORT=6060
+#MODEL="mlx-community/LFM2.5-8B-A1B-MLX-8bit" <--often runs out of tokens
+#MODEL="mlx-community/MiniCPM5-1B-OptiQ-4bit" <-- refuses to use new data beyond internal training set
 MODEL="mlx-community/Phi-3.5-MoE-instruct-8bit"
 #MODEL="mlx-community/Qwen3-14B-4bit"
 PYTHON_BIN="lcenv/bin/python"

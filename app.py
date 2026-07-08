@@ -29,6 +29,7 @@ Usage:
 import asyncio
 import json
 import os
+import sys
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 import re
 import threading
@@ -1397,8 +1398,12 @@ def parse_args():
     p = argparse.ArgumentParser(description="Bottle web UI for DragonflyDB conversational agent")
     p.add_argument("-H", "--host",     default=DRAGONFLY_HOST,          help="DragonflyDB host")
     p.add_argument("-p", "--port",     type=int, default=DRAGONFLY_PORT, help="DragonflyDB port")
-    p.add_argument("-s", "--password", default=DRAGONFLY_PASSWORD)
-    p.add_argument("-u", "--username", default=DRAGONFLY_USERNAME)
+    # Notice the nargs='?' and default=None changes here:
+    p.add_argument("-s", "--password", nargs='?', default=DRAGONFLY_PASSWORD)
+    p.add_argument("-u", "--username", nargs='?', default=DRAGONFLY_USERNAME)
+
+    #p.add_argument("-s", "--password", default=DRAGONFLY_PASSWORD)
+    #p.add_argument("-u", "--username", default=DRAGONFLY_USERNAME)
     p.add_argument("--threshold",      type=float, default=CACHE_DISTANCE_THRESHOLD)
     p.add_argument("--ttl",            type=int,   default=SESSION_TTL_SECONDS, help="Session TTL in seconds")
     p.add_argument("--web-port",       type=int,   default=WEB_PORT)
@@ -1406,8 +1411,20 @@ def parse_args():
 
 
 if __name__ == "__main__":
+    print(f"DEBUG RAW ARGS: {sys.argv}")  # <-- Add this temporarily    
     args = parse_args()
-    redis_url = build_redis_url(args.host, args.port, args.username, args.password)
+    
+    # Clean up empty strings passed from environment variables or command line overrides
+    username = args.username if args.username != "" else None
+    password = args.password if args.password != "" else None
+    
+    # Build adaptive URL based on clean values
+    redis_url = build_redis_url(
+        host=args.host, 
+        port=args.port, 
+        username=username, 
+        password=password
+    )
 
     print(f"Loading embedding model {EMBEDDING_MODEL}…")
     _vectorizer = HFTextVectorizer(model=EMBEDDING_MODEL)
@@ -1422,7 +1439,7 @@ if __name__ == "__main__":
     )
     _llm = ChatOpenAI(base_url=LLM_BASE_URL, model=LLM_MODEL, api_key="not-needed", temperature=LLM_TEMPERATURE_CHAT, max_tokens=TOKEN_LIMIT)
 
-    print(f"Connecting to DragonflyDB at {args.host}:{args.port}…")
+    print(f"Connecting to cache/datastore at {args.host}:{args.port}…")
     run_async(_startup(redis_url, args.ttl))
     print("Ready.")
 

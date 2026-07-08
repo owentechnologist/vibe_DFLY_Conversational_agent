@@ -34,7 +34,9 @@ REDIS_SOCKET_CONNECT_TIMEOUT = float(os.getenv("REDIS_SOCKET_CONNECT_TIMEOUT", "
 # ── LLM ──────────────────────────────────────────────────────────────────────
 
 LLM_BASE_URL               = os.getenv("LLM_BASE_URL",  "http://localhost:6060/v1")
+# the model is picked up from launch.sh if you set it there, this next line will not override it:
 LLM_MODEL                  = os.getenv("LLM_MODEL",     "mlx-community/Qwen3-14B-4bit")
+#This model only works with its trained data and rejects most session-based requests: LLM_MODEL                  = os.getenv("LLM_MODEL", "mlx-community/MiniCPM5-1B-OptiQ-4bit")
 LLM_TEMPERATURE_CHAT       = float(os.getenv("LLM_TEMPERATURE_CHAT",       "0.25"))
 LLM_TEMPERATURE_EXTRACTION = float(os.getenv("LLM_TEMPERATURE_EXTRACTION", "0.05"))
 TOKEN_LIMIT                = int(os.getenv("TOKEN_LIMIT", "24576"))
@@ -83,6 +85,31 @@ TOPK_YEAR_TTL    = int(os.getenv("TOPK_YEAR_TTL",  str(86400 * 1100)))
 def build_redis_url(
     host: str = DRAGONFLY_HOST,
     port: int = DRAGONFLY_PORT,
+    username: str | None = None,
+    password: str | None = None,
+    use_tls: bool = DRAGONFLY_USE_TLS,
+) -> str:
+    """
+    Builds a Redis connection URL adapting dynamically to credentials.
+    Delivers a secure URL if credentials are provided, otherwise an unauthenticated one.
+    """
+    scheme = "rediss" if use_tls else "redis"
+    
+    # Scenario 1: Both username and password are provided
+    if username and password:
+        return f"{scheme}://{username}:{password}@{host}:{port}"
+        
+    # Scenario 2: Only a password is provided (Standard Redis default auth)
+    if password:
+        return f"{scheme}://:{password}@{host}:{port}"
+        
+    # Scenario 3: Unauthenticated / Only host and port are used
+    return f"{scheme}://{host}:{port}"
+
+
+'''def build_redis_url(
+    host: str = DRAGONFLY_HOST,
+    port: int = DRAGONFLY_PORT,
     username: str | None = DRAGONFLY_USERNAME,
     password: str | None = DRAGONFLY_PASSWORD,
     use_tls: bool = DRAGONFLY_USE_TLS,
@@ -95,6 +122,7 @@ def build_redis_url(
         return f"{scheme}://:{password}@{host}:{port}"
     return f"{scheme}://{host}:{port}"
 
+'''
 
 def build_ssl_context(
     ca_cert: str | None = DRAGONFLY_SSL_CA_CERT,
