@@ -28,7 +28,7 @@ Each conversation is identified by a **session ID** (a UUID). Every time you sen
 
 **What it stores:** the full `AgentState` for the thread — every message in the conversation so far.
 
-**Where it lives:** DragonflyDB, port `7900` by default. Keys are managed by the `AsyncRedisSaver` and scoped to the `thread_id`.
+**Where it lives:** DragonflyDB (Redis). Keys are managed by the `AsyncRedisSaver` and scoped to the `thread_id`.
 
 **TTL:** sessions expire after `--ttl` seconds (default 24 hours, `86400`). The TTL refreshes on each read, so an active conversation stays alive. An idle session expires naturally.
 
@@ -85,7 +85,7 @@ You type a message
         │
         ├──▶ cache.store(prompt, response)  [write to semantic cache]
         ├──▶ checkpoint saved               [AsyncRedisSaver writes new state]
-        └──▶ every 3rd turn: background extraction ──▶ DragonflyRedisStore
+        └──▶ every Xth turn (configurable): background extraction ──▶ DragonflyRedisStore
 ```
 
 ---
